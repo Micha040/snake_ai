@@ -19,8 +19,16 @@ class DQN(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, output_size)
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, output_size)
         )
+        
+        # Initialisiere Gewichte für bessere Startbedingungen
+        for layer in self.network:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_normal_(layer.weight)
+                nn.init.zeros_(layer.bias)
     
     def forward(self, x):
         return self.network(x)
@@ -39,18 +47,29 @@ class ReplayMemory:
         return len(self.memory)
 
 class SnakeAI:
-    def __init__(self, input_size=12, hidden_size=256, output_size=3, 
+    def __init__(self, input_size=20, hidden_size=512, output_size=3, 
                  learning_rate=0.001, gamma=0.99, epsilon_start=1.0,
-                 epsilon_end=0.01, epsilon_decay=0.995, memory_size=100000,
-                 batch_size=64, target_update=10):
+                 epsilon_end=0.01, epsilon_decay=0.997, memory_size=100000,
+                 batch_size=128, target_update=10):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Neural Network
+        # Erweiterte Netzwerk-Architektur
         self.policy_net = DQN(input_size, hidden_size, output_size).to(self.device)
         self.target_net = DQN(input_size, hidden_size, output_size).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
+        # Optimizer mit Momentum
+        self.optimizer = optim.AdamW(self.policy_net.parameters(), 
+                                   lr=learning_rate, 
+                                   weight_decay=1e-4,
+                                   amsgrad=True)
+        
+        # Lernraten-Scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='max', factor=0.5, patience=200,
+            verbose=True, min_lr=1e-6
+        )
+        
         self.memory = ReplayMemory(memory_size)
         
         # Hyperparameter
@@ -61,6 +80,16 @@ class SnakeAI:
         self.batch_size = batch_size
         self.target_update = target_update
         
+        # Curriculum Learning
+        self.curriculum_stage = 0
+        self.stage_scores = [10, 20, 30, 40, 50]  # Schwierigkeitsstufen
+        
+        # Exploration Boost
+        self.episodes_since_improvement = 0
+        self.best_avg_score = 0
+        self.boost_threshold = 300  # Episoden ohne Verbesserung
+        self.boost_factor = 0.5  # Wie stark der Boost sein soll
+        
         # Statistiken
         self.scores = []
         self.avg_scores = []
@@ -68,6 +97,7 @@ class SnakeAI:
         self.loss_history = []
         self.best_score = 0
         self.best_episode = 0
+        self.learning_rates = []
         
         self.load_model()
 
@@ -75,65 +105,60 @@ class SnakeAI:
         head = game.snake[0]
         food = game.food
         
-        # Danger straight ahead
-        danger_straight = False
-        danger_right = False
-        danger_left = False
-        
-        # Check direction
-        if game.direction == Direction.UP:
-            point_l = (head[0] - 1, head[1])
-            point_r = (head[0] + 1, head[1])
-            point_u = (head[0], head[1] - 1)
-            danger_straight = point_u in game.snake or point_u[1] < 0
-            danger_right = point_r in game.snake or point_r[0] >= game.GRID_COUNT
-            danger_left = point_l in game.snake or point_l[0] < 0
-        elif game.direction == Direction.DOWN:
-            point_l = (head[0] + 1, head[1])
-            point_r = (head[0] - 1, head[1])
-            point_u = (head[0], head[1] + 1)
-            danger_straight = point_u in game.snake or point_u[1] >= game.GRID_COUNT
-            danger_right = point_r in game.snake or point_r[0] < 0
-            danger_left = point_l in game.snake or point_l[0] >= game.GRID_COUNT
-        elif game.direction == Direction.LEFT:
-            point_l = (head[0], head[1] + 1)
-            point_r = (head[0], head[1] - 1)
-            point_u = (head[0] - 1, head[1])
-            danger_straight = point_u in game.snake or point_u[0] < 0
-            danger_right = point_r in game.snake or point_r[1] < 0
-            danger_left = point_l in game.snake or point_l[1] >= game.GRID_COUNT
-        elif game.direction == Direction.RIGHT:
-            point_l = (head[0], head[1] - 1)
-            point_r = (head[0], head[1] + 1)
-            point_u = (head[0] + 1, head[1])
-            danger_straight = point_u in game.snake or point_u[0] >= game.GRID_COUNT
-            danger_right = point_r in game.snake or point_r[1] >= game.GRID_COUNT
-            danger_left = point_l in game.snake or point_l[1] < 0
-        
-        # State vector
+        # Erweiterte Zustandsrepräsentation
         state = [
-            # Danger
-            danger_straight,
-            danger_right,
-            danger_left,
+            # Gefahren (wie zuvor)
+            *self._get_dangers(game),
             
-            # Direction
+            # Richtung (wie zuvor)
             game.direction == Direction.LEFT,
             game.direction == Direction.RIGHT,
             game.direction == Direction.UP,
             game.direction == Direction.DOWN,
             
-            # Food location
-            food[0] < head[0],  # food left
-            food[0] > head[0],  # food right
-            food[1] < head[1],  # food up
-            food[1] > head[1],  # food down
+            # Normalisierte Positionen
+            head[0] / game.GRID_COUNT,  # x-Position
+            head[1] / game.GRID_COUNT,  # y-Position
+            food[0] / game.GRID_COUNT,  # Essen x
+            food[1] / game.GRID_COUNT,  # Essen y
             
-            # Snake length
-            len(game.snake) / (game.GRID_COUNT * game.GRID_COUNT)
+            # Distanz zum Essen
+            (food[0] - head[0]) / game.GRID_COUNT,  # x-Distanz
+            (food[1] - head[1]) / game.GRID_COUNT,  # y-Distanz
+            
+            # Schlangenlänge und Spielfeld-Nutzung
+            len(game.snake) / (game.GRID_COUNT * game.GRID_COUNT),
+            len(game.snake) / 100  # Normalisierte absolute Länge
         ]
         
         return torch.FloatTensor(state).to(self.device)
+
+    def _get_dangers(self, game):
+        head = game.snake[0]
+        dangers = []
+        
+        # Prüfe in allen 8 Richtungen
+        directions = [
+            (0, -1),  # Oben
+            (1, -1),  # Oben-Rechts
+            (1, 0),   # Rechts
+            (1, 1),   # Unten-Rechts
+            (0, 1),   # Unten
+            (-1, 1),  # Unten-Links
+            (-1, 0),  # Links
+            (-1, -1)  # Oben-Links
+        ]
+        
+        for dx, dy in directions:
+            pos = (head[0] + dx, head[1] + dy)
+            danger = (
+                pos in game.snake or
+                pos[0] < 0 or pos[0] >= game.GRID_COUNT or
+                pos[1] < 0 or pos[1] >= game.GRID_COUNT
+            )
+            dangers.append(danger)
+        
+        return dangers
 
     def get_action(self, state):
         if random.random() < self.epsilon:
@@ -155,28 +180,47 @@ class SnakeAI:
         next_state_batch = torch.stack(batch[3])
         done_batch = torch.FloatTensor(batch[4]).to(self.device)
         
-        # Compute Q(s_t, a)
+        # Double DQN
+        with torch.no_grad():
+            next_actions = self.policy_net(next_state_batch).max(1)[1].unsqueeze(1)
+            next_state_values = self.target_net(next_state_batch).gather(1, next_actions)
+            expected_state_action_values = (next_state_values.squeeze() * self.gamma * (1 - done_batch)) + reward_batch
+        
         state_action_values = self.policy_net(state_batch).gather(1, action_batch.unsqueeze(1))
         
-        # Compute V(s_{t+1}) for all next states
-        next_state_values = torch.zeros(self.batch_size, device=self.device)
-        with torch.no_grad():
-            next_state_values = self.target_net(next_state_batch).max(1)[0]
-        
-        # Compute the expected Q values
-        expected_state_action_values = (next_state_values * self.gamma * (1 - done_batch)) + reward_batch
-        
-        # Compute Huber loss
+        # Huber Loss für stabileres Training
         criterion = nn.SmoothL1Loss()
         loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
         
-        # Optimize the model
+        # Gradient Clipping
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), 100)
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
         self.optimizer.step()
         
         return loss.item()
+
+    def check_curriculum_progress(self, avg_score):
+        if self.curriculum_stage < len(self.stage_scores):
+            if avg_score >= self.stage_scores[self.curriculum_stage]:
+                self.curriculum_stage += 1
+                # Erhöhe temporär die Exploration
+                self.epsilon = min(0.5, self.epsilon * 2)
+                return True
+        return False
+
+    def check_exploration_boost(self, avg_score):
+        if avg_score > self.best_avg_score:
+            self.best_avg_score = avg_score
+            self.episodes_since_improvement = 0
+        else:
+            self.episodes_since_improvement += 1
+            
+        if self.episodes_since_improvement >= self.boost_threshold:
+            self.epsilon = min(0.5, self.epsilon + self.boost_factor)
+            self.episodes_since_improvement = 0
+            return True
+        return False
 
     def train(self, episodes=10000, save_interval=100, render_interval=10):
         game = SnakeGame()
@@ -228,18 +272,8 @@ class SnakeAI:
                     new_length = len(game.snake)
                     done = game.game_state == "GAME_OVER"
                     
-                    # Belohnung berechnen
-                    reward = 0
-                    if done:
-                        reward = -10
-                    elif new_length > old_length:
-                        reward = 10
-                        steps_without_food = 0
-                    else:
-                        steps_without_food += 1
-                        if steps_without_food > 100:
-                            done = True
-                            reward = -10
+                    # Curriculum-basierte Belohnung
+                    reward = self._get_curriculum_reward(game, done, old_length, new_length, steps_without_food)
                     
                     # Nächsten Zustand holen
                     next_state = self.get_state(game)
@@ -254,6 +288,13 @@ class SnakeAI:
                     total_reward += reward
                     episode_steps += 1
                     
+                    if new_length > old_length:
+                        steps_without_food = 0
+                    else:
+                        steps_without_food += 1
+                        if steps_without_food > 100 + len(game.snake):  # Dynamisches Zeitlimit
+                            done = True
+                    
                     # Visualisierung
                     if (episode + 1) % render_interval == 0:
                         game.draw()
@@ -267,12 +308,28 @@ class SnakeAI:
                 score = game.score
                 self.scores.append(score)
                 recent_scores.append(score)
-                self.avg_scores.append(np.mean(recent_scores))
+                avg_score = np.mean(recent_scores)
+                self.avg_scores.append(avg_score)
                 self.epsilon_history.append(self.epsilon)
                 self.loss_history.append(episode_loss)
                 
-                # Epsilon Update
-                self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+                # Lernraten-Anpassung
+                self.scheduler.step(avg_score)
+                current_lr = self.optimizer.param_groups[0]['lr']
+                self.learning_rates.append(current_lr)
+                
+                # Curriculum Check
+                if self.check_curriculum_progress(avg_score):
+                    print(f"\nNeue Schwierigkeitsstufe erreicht: {self.curriculum_stage}")
+                
+                # Exploration Boost Check
+                if self.check_exploration_boost(avg_score):
+                    print(f"\nExploration Boost aktiviert! Neues Epsilon: {self.epsilon:.4f}")
+                
+                # Epsilon Update mit dynamischer Anpassung
+                if not self.check_curriculum_progress(avg_score):
+                    self.epsilon = max(self.epsilon_end, 
+                                     self.epsilon * (self.epsilon_decay + min(0.002, score/1000)))
                 
                 # Target Network Update
                 update_count += 1
@@ -297,8 +354,10 @@ class SnakeAI:
                     
                     print(f"\nEpisode: {episode + 1}/{episodes}")
                     print(f"Score: {score}, Best Score: {self.best_score}")
-                    print(f"Avg Score (last 100): {np.mean(recent_scores):.2f}")
+                    print(f"Avg Score (last 100): {avg_score:.2f}")
                     print(f"Epsilon: {self.epsilon:.4f}")
+                    print(f"Lernrate: {current_lr:.6f}")
+                    print(f"Curriculum Stage: {self.curriculum_stage}")
                     print(f"Durchschnittlicher Loss: {episode_loss:.4f}")
                     print(f"Geschätzte verbleibende Zeit: {estimated_remaining_time/60:.1f} Minuten")
                     print("-" * 50)
@@ -317,9 +376,45 @@ class SnakeAI:
         print("\nTraining abgeschlossen!")
         print(f"Bester Score: {self.best_score} (Episode {self.best_episode})")
         print(f"Durchschnittlicher Score (letzte 100): {np.mean(recent_scores):.2f}")
+        print(f"Finale Lernrate: {current_lr:.6f}")
         
         self.save_model()
         self.plot_progress()
+
+    def _get_curriculum_reward(self, game, done, old_length, new_length, steps_without_food):
+        head = game.snake[0]
+        food = game.food
+        
+        if done:
+            return -10 * (1 + self.curriculum_stage * 0.2)  # Härtere Bestrafung in höheren Stufen
+        
+        reward = 0
+        
+        # Basis-Belohnung für Essen
+        if new_length > old_length:
+            reward += 10 + self.curriculum_stage * 2  # Höhere Belohnung in höheren Stufen
+        
+        # Bestrafung für Zeitverschwendung
+        reward -= steps_without_food * (0.01 + self.curriculum_stage * 0.002)
+        
+        # Zusätzliche Belohnungen basierend auf der Curriculum-Stufe
+        if self.curriculum_stage >= 1:
+            # Belohnung für effiziente Bewegung zum Essen
+            old_distance = abs(game.snake[0][0] - food[0]) + abs(game.snake[0][1] - food[1])
+            new_distance = abs(head[0] - food[0]) + abs(head[1] - food[1])
+            if new_distance < old_distance:
+                reward += 0.1 * (1 + self.curriculum_stage * 0.1)
+        
+        if self.curriculum_stage >= 2:
+            # Belohnung für Überleben mit langer Schlange
+            reward += 0.01 * len(game.snake) * (1 + self.curriculum_stage * 0.1)
+        
+        if self.curriculum_stage >= 3:
+            # Belohnung für effiziente Raumnutzung
+            space_efficiency = len(game.snake) / (game.GRID_COUNT * game.GRID_COUNT)
+            reward += space_efficiency * (1 + self.curriculum_stage * 0.2)
+        
+        return reward
 
     def save_model(self):
         torch.save({
@@ -350,28 +445,35 @@ class SnakeAI:
             self.epsilon = checkpoint['epsilon']
 
     def plot_progress(self):
-        plt.figure(figsize=(15, 5))
+        plt.figure(figsize=(20, 5))
         
         # Score Plot
-        plt.subplot(131)
+        plt.subplot(141)
         plt.plot(self.scores)
         plt.title('Scores')
         plt.xlabel('Episode')
         plt.ylabel('Score')
         
         # Average Score Plot
-        plt.subplot(132)
+        plt.subplot(142)
         plt.plot(self.avg_scores)
         plt.title('Average Scores (last 100)')
         plt.xlabel('Episode')
         plt.ylabel('Average Score')
         
         # Epsilon Plot
-        plt.subplot(133)
+        plt.subplot(143)
         plt.plot(self.epsilon_history)
         plt.title('Epsilon')
         plt.xlabel('Episode')
         plt.ylabel('Epsilon')
+        
+        # Learning Rate Plot
+        plt.subplot(144)
+        plt.plot(self.learning_rates)
+        plt.title('Learning Rate')
+        plt.xlabel('Episode')
+        plt.ylabel('Learning Rate')
         
         plt.tight_layout()
         plt.savefig('training_progress.png')
